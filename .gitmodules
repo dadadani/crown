@@ -1,0 +1,4 @@
+[submodule "src/crown/private/bindings/nghttp2/nghttp2"]
+	path = src/crown/private/bindings/nghttp2/nghttp2
+	url = https://github.com/nghttp2/nghttp2
+    branch = v1.55.x
