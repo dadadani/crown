@@ -1,4 +1,4 @@
-import private/bindings/nghttp2/nghttp2
+import private/transports/http2/nghttp2
 import std/asyncnet, std/tables, std/net, std/asyncdispatch
 import std/deques
 import std/uri
