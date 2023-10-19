@@ -1,21 +1,21 @@
 import std/httpcore
 import std/asyncdispatch, std/asyncstreams
 import std/asyncnet, std/options
-import std/uri, std/strformat, std/strutils
+import std/uri, std/strformat, std/strutils, std/parseutils
 import ../../utils
 
 from std/httpclient import ProtocolError, HttpRequestError
 
-type HTTP1Base = object of RootObj
+type HTTP1Base* = object of RootObj
     allowHTTP09*: bool
     allowHTTP10*: bool
     allowHTTP11*: bool
     allowUpgradeToHTTP2*: bool
     socket*: AsyncSocket
 
-type HTTP1Client = object of HTTP1Base
+type HTTP1Client* = object of HTTP1Base
 
-proc generateHeaders(version: utils.Http1Version, url: Uri, `method`: HttpMethod, headers: HttpHeaders, contentLength: int): string =
+proc generateHeaders(version: utils.Http1Version, url: Uri, `method`: HttpMethod, headers: HttpHeaders): string =
     if version == utils.HttpVersion09:
         doAssert `method` == HttpGet, "HTTP/0.9 only supports GET method"
         result = "GET "
@@ -41,66 +41,148 @@ proc generateHeaders(version: utils.Http1Version, url: Uri, `method`: HttpMethod
     if headers != nil:
         for key, val in headers:
             result.add(&"{key}: {val}" & httpNewLine)
+    
+    result.add(httpNewLine)
 
-proc streamWriter*(self: HTTP1Client, stream: FutureStream[string], contentLength: int = 0, alreadyRead = 0) {.async.} =
+proc forceRead*(self: AsyncSocket, size: int) {.async.} =
+    var read = 0
+    while true:
+        let buffer = await self.recv(size - read)
+        if buffer.len == 0:
+            raise newException(HttpRequestError, "Server terminated connection prematurely")
+        read += buffer.len
+        if read == size:
+            break
+
+proc streamWriterChunked*(self: HTTP1Client, stream: FutureStream[string], version: Http1Version, connectionKeepAlive: bool) {.async.} =
+    while true:
+        var chunkSize = 0
+        var chunkSizeStr = await self.socket.recvLine()
+        var i = 0
+        if chunkSizeStr == "":
+            raise newException(HttpRequestError, "Server terminated connection prematurely")
+        while i < chunkSizeStr.len:
+            case chunkSizeStr[i]
+            of '0'..'9':
+                chunkSize = chunkSize shl 4 or (ord(chunkSizeStr[i]) - ord('0'))
+            of 'a'..'f':
+                chunkSize = chunkSize shl 4 or (ord(chunkSizeStr[i]) - ord('a') + 10)
+            of 'A'..'F':
+                chunkSize = chunkSize shl 4 or (ord(chunkSizeStr[i]) - ord('A') + 10)
+            of ';':
+                # http://tools.ietf.org/html/rfc2616#section-3.6.1
+                # We don't care about chunk-extensions.
+                break
+            else:
+                raise newException(HttpRequestError, "Invalid chunk size")
+            inc(i)
+        if chunkSize <= 0:
+            await self.socket.forceRead(2)
+            stream.complete()
+            break
+        
+        block:
+            var read = 0
+            while read < chunkSize:
+                let buffer = await self.socket.recv(chunkSize - read)
+                if buffer.len == 0:
+                    raise newException(HttpRequestError, "Server terminated connection prematurely")
+                read += buffer.len
+                await stream.write(buffer)
+        
+        await self.socket.forceRead(2)
+
+
+            
+
+proc streamWriter*(self: HTTP1Client, stream: FutureStream[string], version: Http1Version, connectionKeepAlive: bool, contentLength: int = 0, alreadyRead = 0) {.async.} =
+    let bufferSize = if contentLength != 0: contentLength else: TCP_BUFFER_SIZE
     var read = alreadyRead
     while read < contentLength:
-        let line = await self.socket.recv(TCP_BUFFER_SIZE)
+        let buffer = await self.socket.recv(bufferSize - read)
 
-        if line.len == 0:
-            if contentLength != 0 and read < contentLength:
+        if buffer.len == 0:
+            if contentLength != 0 and read != contentLength:
                 stream.fail(newException(HttpRequestError, "Got disconnected while trying to read body."))
                 break
             else:
                 stream.complete()
                 break
         
-        read += line.len
         
-        
+        read += buffer.len
+        await stream.write(buffer)
 
-
-
-proc responseHeaderReader*(self: HTTP1Client): Future[FutureStream[string]] {.async.} =
+    stream.complete()
+    if version == HttpVersion09 or version == HttpVersion10 or (version == HttpVersion11 and not connectionKeepAlive):
+        self.socket.close()
     
-    result = newFutureStream[string]("HTTP1Client.responseHeaderReader")
+
+proc responseHeaderReader*(self: HTTP1Client): Future[(string, HttpHeaders, Option[FutureStream[string]])] {.async.} =
     var line = ""
     var parsedStatus = false
+    var version: utils.Http1Version
+
     while true:
         line = await self.socket.recvLine()
         if line.len == 0:
             raise newException(HttpRequestError, "Got disconnected while trying to read body.")
         
-        var version: utils.Http1Version
+        if line == httpNewLine:
+            break
 
-        if line.startsWith("HTTP/1.1"):
-            if not self.allowHTTP11:
-                raise newException(HttpRequestError, "HTTP/1.1 is not allowed")
-            version = utils.HttpVersion11
-        elif line.startsWith("HTTP/1.0"):
-            if not self.allowHTTP10:
-                raise newException(HttpRequestError, "HTTP/1.0 is not allowed")
-            version = utils.HttpVersion10
-        else:
-            if not self.allowHTTP09:
-                raise newException(HttpRequestError, "HTTP/0.9 is not allowed")
-            version = utils.HttpVersion09
-        
-        if version == HttpVersion09:
-            await result.write(line)
-            asyncCheck self.streamWriter(result, line.len)
-            return
-        else:
-            # parse status code
-            let status = line[9..12]
+        if not parsedStatus:
+
+            if line.startsWith("HTTP/1.1"):
+                if not self.allowHTTP11:
+                    raise newException(HttpRequestError, "HTTP/1.1 is not allowed")
+                version = utils.HttpVersion11
+            elif line.startsWith("HTTP/1.0"):
+                if not self.allowHTTP10:
+                    raise newException(HttpRequestError, "HTTP/1.0 is not allowed")
+                version = utils.HttpVersion10
+            else:
+                if not self.allowHTTP09:
+                    raise newException(HttpRequestError, "HTTP/0.9 is not allowed")
+                version = utils.HttpVersion09
+
+            parsedStatus = true
             
-        
+            if version == HttpVersion09:
+                result[2] = some(newFutureStream[string]("HTTP1Client.responseHeaderReader"))
+                await result[2].get.write(line)
+                asyncCheck self.streamWriter(result[2].get, version, false, alreadyread = line.len)
+                return
+            
+            result[1] = newHttpHeaders()
 
+            # parse status code
+            let skip = skipWhitespace(line, 9)
+            result[0] = line[8+skip..line.high].strip()
+
+        else:
+            var name = ""
+            var tok = parseUntil(line, name, ':') 
+            
+            if tok == 0 or line[tok] != ':':
+                raise newException(HttpRequestError, "invalid headers")
+
+            result[1].add(name, line[tok+1..line.high].strip())
+
+            if result[1].len > 100: # todo: change 100 to a constant
+                raise newException(HttpRequestError, "too many headers")
         
     
+    result[2] = some(newFutureStream[string]("HTTP1Client.responseHeaderReader"))
+    if result[1].getOrDefault("Transfer-Encoding") == "chunked":
+        asyncCheck self.streamWriterChunked(result[2].get, version, result[1].getOrDefault("Connection") == "keep-alive")
+    elif result[1].getOrDefault("Content-Length") != "":
+        let length = result[1].getOrDefault("Content-Length").parseInt()
+        asyncCheck self.streamWriter(result[2].get, version, result[1].getOrDefault("Connection") == "keep-alive", contentLength = length)
 
+            
     
-proc sendRequest*(self: HTTP1Client, url: Uri, `method`: HttpMethod, headers: HttpHeaders, body: FutureStream[string] | string = "", contentLength: int = 0): Future[(HttpCode, HttpHeaders, Option[FutureStream[string]])] {.asynself.} = 
+proc sendRequest*(self: HTTP1Client, url: Uri, `method`: HttpMethod, headers: HttpHeaders, body: FutureStream[string] | string = "", contentLength: int = 0): Future[(string, HttpHeaders, Option[FutureStream[string]])] {.async.} = 
     var version: utils.Http1Version
     if self.allowHTTP11:
         version = utils.HttpVersion11
@@ -112,6 +194,7 @@ proc sendRequest*(self: HTTP1Client, url: Uri, `method`: HttpMethod, headers: Ht
         raise newException(HttpRequestError, "No HTTP version allowed")
 
     var newHeaders: HttpHeaders
+    
 
     if version != HttpVersion09:
         newHeaders = newHttpHeaders()
@@ -128,14 +211,37 @@ proc sendRequest*(self: HTTP1Client, url: Uri, `method`: HttpMethod, headers: Ht
                         raise newException(ValueError, "Content-Length must be specified when using FutureStream[string] as body")
             for key, val in headers:
                 newHeaders.add(key, val)
+        else:
+            if contentLength != 0:
+                newHeaders.add("Content-Length", $contentLength)
+            else:
+                if body is string:
+                    if body.len > 0:
+                        newHeaders.add("Content-Length", $body.len)
+                else:
+                    raise newException(ValueError, "Content-Length must be specified when using FutureStream[string] as body")
     
-    let rawHeader = generateHeaders(version, url, `method`, newHeaders, contentLength)
+    let rawHeader = generateHeaders(version, url, `method`, newHeaders)
 
     if self.socket.isClosed:
         raise newException(HttpRequestError, "Socket is closed")
 
     if version == HttpVersion09:
         await self.socket.send(rawHeader)
+        return await responseHeaderReader(self)
+    else:
+        await self.socket.send(rawHeader)
+        when body is string:
+            if body.len > 0:
+                await self.socket.send(body)
+        else:
+            while not body.finished:
+                await self.socket.send(await body.read)
+        return await responseHeaderReader(self)
+
+
+    
+
     
 
 
