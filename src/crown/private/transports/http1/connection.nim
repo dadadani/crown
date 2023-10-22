@@ -96,12 +96,13 @@ proc streamWriterChunked*(self: HTTP1Client, stream: FutureStream[string], versi
             
 
 proc streamWriter*(self: HTTP1Client, stream: FutureStream[string], version: Http1Version, connectionKeepAlive: bool, contentLength: int = 0, alreadyRead = 0) {.async.} =
-    let bufferSize = if contentLength != 0: contentLength else: TCP_BUFFER_SIZE
+    let bufferSize = if contentLength != 0: min(contentLength, TCP_BUFFER_SIZE) else: TCP_BUFFER_SIZE
     var read = alreadyRead
+    var buffer = newString(bufferSize)
     while read < contentLength:
-        let buffer = await self.socket.recv(bufferSize - read)
+        let readb = await self.socket.recvInto(addr buffer[0], bufferSize)
 
-        if buffer.len == 0:
+        if readb == 0:
             if contentLength != 0 and read != contentLength:
                 stream.fail(newException(HttpRequestError, "Got disconnected while trying to read body."))
                 break
@@ -110,7 +111,7 @@ proc streamWriter*(self: HTTP1Client, stream: FutureStream[string], version: Htt
                 break
         
         
-        read += buffer.len
+        read += readb
         await stream.write(buffer)
 
     stream.complete()
