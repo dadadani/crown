@@ -4,6 +4,8 @@ import std/asyncnet, std/options
 import std/uri, std/strformat, std/strutils, std/parseutils
 import ../../utils
 
+import std/asyncfile
+
 from std/httpclient import ProtocolError, HttpRequestError
 
 type HTTP1Base* = object of RootObj
@@ -84,11 +86,13 @@ proc streamWriterChunked*(self: HTTP1Client, stream: FutureStream[string], versi
         block:
             var read = 0
             while read < chunkSize:
-                let buffer = await self.socket.recv(chunkSize - read)
-                if buffer.len == 0:
+                var buffer = newString(chunkSize - read)
+                let readb = await self.socket.recvInto(addr buffer[0], chunkSize - read)
+                if readb == 0:
                     raise newException(HttpRequestError, "Server terminated connection prematurely")
                 read += buffer.len
-                await stream.write(buffer)
+                buffer.setLen(readb)
+                await stream.write(move(buffer))
         
         await self.socket.forceRead(2)
 
@@ -98,21 +102,22 @@ proc streamWriterChunked*(self: HTTP1Client, stream: FutureStream[string], versi
 proc streamWriter*(self: HTTP1Client, stream: FutureStream[string], version: Http1Version, connectionKeepAlive: bool, contentLength: int = 0, alreadyRead = 0) {.async.} =
     let bufferSize = if contentLength != 0: min(contentLength, TCP_BUFFER_SIZE) else: TCP_BUFFER_SIZE
     var read = alreadyRead
-    var buffer = newString(bufferSize)
+    let art = openAsync("art.bin", fmWrite)
     while read < contentLength:
+        var buffer = newString(bufferSize)
         let readb = await self.socket.recvInto(addr buffer[0], bufferSize)
-
         if readb == 0:
             if contentLength != 0 and read != contentLength:
                 stream.fail(newException(HttpRequestError, "Got disconnected while trying to read body."))
-                break
-            else:
-                stream.complete()
-                break
-        
+            break
+    
+        buffer.setLen(readb)
+
         
         read += readb
-        await stream.write(buffer)
+        #echo buffer
+        await art.write(move(buffer))
+        #await stream.write(move(buffer))
 
     stream.complete()
     if version == HttpVersion09 or version == HttpVersion10 or (version == HttpVersion11 and not connectionKeepAlive):

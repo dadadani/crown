@@ -14,12 +14,12 @@ proc ac() {.async.} =
     let net = asyncnet.newAsyncSocket(buffered = false)
     let ssl = newContext()
     wrapSocket(ssl, net)
-    await net.connect("testfileorg.netwet.net", 443.Port)
+    await net.connect("archmirror.it", 443.Port)
     echo "dial done"
     let http1 = HTTP1Client(allowHTTP11: true, socket: net)
     echo "send request"
     let headers = newHttpHeaders()
-    var req = await http1.sendRequest(uri.parseUri("https://testfileorg.netwet.net/testfile.org-1GB-%20Corrupt.zip"), HttpGet, headers)
+    var req = await http1.sendRequest(uri.parseUri("https://archmirror.it/repos/extra/os/x86_64/linux-hardened-6.5.7.hardened1-1-x86_64.pkg.tar.zst"), HttpGet, headers)
     echo req
     echo "send request done"
     if not req[2].isSome:
