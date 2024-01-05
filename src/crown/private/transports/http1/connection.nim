@@ -6,6 +6,8 @@ import std/net
 import ../base_tcp
 import picohttpparser
 
+import std/asyncfile
+
 from std/httpclient import ProtocolError, HttpRequestError
 
 type HTTP1Base* = ref object of RootObj
