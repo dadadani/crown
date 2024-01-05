@@ -1,8 +1,11 @@
 import private/transports/http2/nghttp2
-import std/asyncnet, std/tables, std/net, std/asyncdispatch
+import uva, uva/tcp, std/tables, std/net
 import std/deques
 import std/uri
 import openssl
+import private/transports/base_tcp
+
+
 
 type 
   StreamData* = ref object
@@ -20,7 +23,7 @@ type
 
   HTTP2Base* = ref object
     session: ptr nghttp2.Session
-    transport: AsyncSocket
+    transport: HttpTcpStream
     streamData: Table[int, StreamData]
     maxStreams: int = 10 # it will be increased by the SETTINGS frame
     writingPaused: bool
@@ -55,9 +58,10 @@ proc updateSettings*(self: HTTP2Base) =
 proc receiveWorker*(self: HTTP2Base) {.async.} = 
     while true:
         echo "lenlen: ", self.streamData.len
-        var buffer = await self.transport.recv(65535)
+        var buffer = await self.transport.recv(65535, false)
         echo "Received ", buffer.len, " bytes, isClosed: ", self.transport.isClosed()
-        if buffer.len > 0 and not self.transport.isClosed():
+        #echo "data: ", cast[seq[uint8]](buffer)
+        if buffer.len > 0 and buffer != cast[string](@[0'u8]) and not self.transport.isClosed():
             echo "Received ", buffer.len, " bytes"
             let processedLen = self.session.sessionMemRecv(cast[ptr uint8](addr buffer[0]), csize_t(buffer.len))
             echo "Processed ", processedLen, " bytes"
@@ -163,7 +167,28 @@ proc onHeader(session: ptr Session; frame: ptr Frame;
 proc MakeNV(name: string, value: string): Nv =
     return Nv(name: cast[ptr uint8](addr name[0]), namelen: csize_t(name.len), value: cast[ptr uint8](addr value[0]), valuelen: csize_t(value.len), flags: uint8(NGHTTP2_NV_FLAG_NONE))
 
-            
+proc nextProtoSelectCallback(s: SslPtr; out_proto: cstring; outlen: cstring; in_proto: cstring; inlen: cuint; arg: pointer): cint {.cdecl.} =
+    let err = selectNextProtocol(cast[ptr ptr cuchar](addr out_proto), cast[ptr cuchar](outlen), cast[ptr cuchar](in_proto), inlen)
+    if err != 0:
+        return SSL_TLSEXT_ERR_NOACK
+    return SSL_TLSEXT_ERR_OK
+
+proc createSSL(sslctx: SslCtx): SslPtr =
+    result = SSL_new(sslctx)
+    if isNil result:
+        raise newException(Defect, "Failed to create SSL object" & $ERR_error_string(culong(ERR_peek_last_error()), nil))
+
+proc createSSLCTX(): SslCtx =
+    result = SSL_CTX_new(SSLv23_client_method())
+    if isNil result:
+        raise newException(Defect, "Failed to create SSL context" & $ERR_error_string(culong(ERR_peek_last_error()), nil))
+    #SSL_CTX_set_next_proto_select_cb(result, nextProtoSelectCallback, nil)
+
+    if getOpenSSLVersion() > 0x10002000:
+        discard SSL_CTX_set_alpn_protos(result, NGHTTP2_PROTO_ALPN, NGHTTP2_PROTO_ALPN_LEN);
+
+    discard
+
 proc makeRequest(self: HTTP2Base, url: string|Uri, headers: Table[string, string] = initTable[string, string]()): Future[Response] = 
 
     var uri: Uri
@@ -227,16 +252,15 @@ proc calloc(nmemb: csize_t; size: csize_t; memUserData: pointer): pointer {.cdec
 
 proc createHTTP2(host: string, port: Port): Future[HTTP2Base] {.async.} =
     result = HTTP2Base()
-
-
-    result.transport = newAsyncSocket(buffered=false)
+    result.transport = HttpTcpStream()
+    #result.transport = newAsyncSocket(buffered=false)
     var sslctx = newContext(verifyMode = CVerifyNone)
 
     var res = SSL_CTX_set_alpn_protos(sslctx.context, cstring("\x02h2"), cuint(3))
     if res != 0:
         raise newException(Defect, "Failed to set ALPN protocols: " & $ERR_error_string(culong(ERR_peek_last_error()), nil))
 
-    wrapSocket(sslctx, result.transport)
+    wrapSSL(result.transport, sslctx)
 
 
 
