@@ -113,14 +113,14 @@ type
 
 
 type 
-  Nghttp2Struct* = object
-  RcBuf* = distinct Nghttp2Struct
-  Session* = distinct Nghttp2Struct
-  SessionCallbacks* = distinct Nghttp2Struct
-  Option* = distinct Nghttp2Struct
-  Stream* = distinct Nghttp2Struct
-  HdDeflater* = distinct Nghttp2Struct
-  HdInflater* = distinct Nghttp2Struct
+  RcBuf* {.importc: "nghttp2_rcbuf", header: "nghttp2/nghttp2.h", bycopy.} = object
+  Session* {.importc: "nghttp2_session", header: "nghttp2/nghttp2.h", bycopy.} = object
+  SessionCallbacks* {.importc: "nghttp2_session_callbacks", header: "nghttp2/nghttp2.h", bycopy.} = object
+  Option* {.importc: "nghttp2_option", header: "nghttp2/nghttp2.h", bycopy.} = object
+  Stream* {.importc: "nghttp2_stream", header: "nghttp2/nghttp2.h", bycopy.} = object
+  HdDeflater* {.importc: "nghttp2_hd_deflater", header: "nghttp2/nghttp2.h", bycopy.} = object
+  HdInflater* {.importc: "nghttp2_hd_inflater", header: "nghttp2/nghttp2.h", bycopy.} = object
+
 
 proc rcbufIncref*(rcbuf: ptr Rcbuf) {.cdecl, importc: "nghttp2_rcbuf_incref",
                                       header: "nghttp2/nghttp2.h".}
@@ -168,7 +168,7 @@ type
     NGHTTP2_FLAG_PRIORITY = 0x20
 
 const
-  NGHTTP2_FLAG_ACK = NGHTTP2_FLAG_END_STREAM
+  NGHTTP2_FLAG_ACK* = NGHTTP2_FLAG_END_STREAM
 
 
 type
@@ -229,7 +229,7 @@ type
   DataSourceReadCallback* = proc (session: ptr Session; streamId: int32;
                                   buf: ptr uint8; length: csize_t;
                                   dataFlags: ptr uint32; source: ptr DataSource;
-                                  userData: pointer): cint {.cdecl.}
+                                  userData: pointer): int {.cdecl.}
 
 
 type

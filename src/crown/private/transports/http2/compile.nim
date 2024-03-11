@@ -54,10 +54,9 @@ proc createVersionFile() =
 
 static:
     createVersionFile()
-
-
+when defined unix:
+    {.passc: "-DHAVE_NETINET_IN_H".}
 {.passc: "-I" & PATH_LIB / "includes".}
-
 
 {.compile: PATH_LIB / "nghttp2_buf.c".}
 {.compile: PATH_LIB / "nghttp2_callbacks.c".}

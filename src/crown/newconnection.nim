@@ -1,4 +1,4 @@
-import private/transports/http2/nghttp2
+#[import private/transports/http2/nghttp2
 import uva, uva/tcp, std/tables, std/net
 import std/deques
 import std/uri
@@ -60,8 +60,7 @@ proc receiveWorker*(self: HTTP2Base) {.async.} =
         echo "lenlen: ", self.streamData.len
         var buffer = await self.transport.recv(65535, false)
         echo "Received ", buffer.len, " bytes, isClosed: ", self.transport.isClosed()
-        #echo "data: ", cast[seq[uint8]](buffer)
-        if buffer.len > 0 and buffer != cast[string](@[0'u8]) and not self.transport.isClosed():
+        if buffer.len > 0 and buffer != @[0-] and not self.transport.isClosed():
             echo "Received ", buffer.len, " bytes"
             let processedLen = self.session.sessionMemRecv(cast[ptr uint8](addr buffer[0]), csize_t(buffer.len))
             echo "Processed ", processedLen, " bytes"
@@ -320,3 +319,4 @@ proc runn() {.async.} =
 asyncCheck runn()
 
 runForever()
+]#

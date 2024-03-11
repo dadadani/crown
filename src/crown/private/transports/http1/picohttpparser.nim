@@ -1,3 +1,5 @@
+import std/os
+{.passc: "-I" & (currentSourcePath() / ".." ).}
 {.compile: "picohttpparser.c"}
 
 type

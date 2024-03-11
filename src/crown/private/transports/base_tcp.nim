@@ -1,4 +1,4 @@
-import pkg/uva, pkg/uva/tcp
+import pkg/uva, pkg/uva/tcp, pkg/uva/resolveaddr
 import std/net
 
 const defineSsl = defined(ssl) or defined(nimdoc)
@@ -16,8 +16,6 @@ when defineSsl:
 type 
   HttpTcpStream* = ref object
     stream: TCP
-    address: string
-    port: Port
     useSSL: bool
     when defineSsl:
       sslHandle: SslPtr
@@ -25,9 +23,9 @@ type
       bioIn: BIO
       bioOut: BIO
       sslNoShutdown: bool
-      readFuture: Future[void]
+      #readFuture: Future[void]
 
-  ReadUnbufferedCallback* = proc (self: HttpTcpStream, data: string)
+#  ReadUnbufferedCallback* = proc (self: HttpTcpStream, data: string)
 
 
 when defineSsl:
@@ -41,9 +39,7 @@ when defineSsl:
       if read < 0:
         raiseSSLError()
       data.setLen(read)
-      echo "yes, there is pending data"
       await socket.stream.send(data)
-      echo "sent pending data OK"
   
 
   proc getSslError(socket: HttpTcpStream, err: cint): cint =
@@ -72,7 +68,7 @@ when defineSsl:
     of SSL_ERROR_WANT_WRITE:
       await sendPendingSslData(socket)
     of SSL_ERROR_WANT_READ:
-        if socket.stream.isBuffered:
+        
           var data = await socket.stream.recvSingle(BufferSize)
           let length = len(data)
           if length > 0:
@@ -80,15 +76,11 @@ when defineSsl:
             if ret < 0:
               raiseSSLError()
           elif length == 0:
+            echo "HTTPTCPSTREAM: length == 0"
             # connection not properly closed by remote side or connection dropped
             SSL_set_shutdown(socket.sslHandle, SSL_RECEIVED_SHUTDOWN)
             result = false
-        else:
-          if socket.stream.isClosed:
-            SSL_set_shutdown(socket.sslHandle, SSL_RECEIVED_SHUTDOWN)
-            result = false
-          else:
-            await socket.readFuture
+        
     else:
       raiseSSLError("Cannot appease SSL.")
 
@@ -154,12 +146,22 @@ proc send*(self: HttpTcpStream, data: string) {.async.} =
     await self.stream.send(data)
 
 proc isClosed*(self: HttpTcpStream): bool =
-    return self.stream.isClosed
+    return (isNil self.stream) or self.stream.isClosed
+
+proc isActive*(self: HttpTcpStream): bool =
+    return (not isNil self.stream) and self.stream.isActive
+
+proc isWritable*(self: HttpTcpStream): bool =
+    return (not isNil self.stream) and self.stream.isWritable
+
+proc isReadable*(self: HttpTcpStream): bool =
+    return (not isNil self.stream) and self.stream.isReadable
 
 proc close*(self: HttpTcpStream) {.async.} =
   if self.isClosed: return
 
   defer:
+    echo "closing tcp stream"
     await self.stream.close()
 
   when defineSsl:
@@ -169,6 +171,7 @@ proc close*(self: HttpTcpStream) {.async.} =
         # established, see:
         # https://github.com/openssl/openssl/issues/710#issuecomment-253897666
         if not self.sslNoShutdown and SSL_in_init(self.sslHandle) == 0:
+          echo "shutting down ssl"
           ErrClearError()
           SSL_shutdown(self.sslHandle)
         else:
@@ -205,47 +208,29 @@ proc recv*(self: HttpTcpStream, size: int, wait = false): Future[string] {.async
           return ""
       result = move(data)
   else:
-    result = await self.stream.recv(size)
-
-
-proc connect*(self: HttpTcpStream, host: string, port: Port, buffered = true, readUnbufferedCallback: ReadUnbufferedCallback = nil): Future[void] {.async.} = 
-  
-  proc readCallback(data: string): Future[void] {.async.} =
-    if self.useSSL:
-      when defineSsl:
-          if data.len == 0:
-            return
-          let ret = bioWrite(self.bioIn, cast[cstring](addr data[0]), len(data).cint)
-          if ret < 0:
-            raiseSSLError()
-          self.readFuture.complete()
-          self.readFuture = newFuture[void]("HttpTcpStream.readFuture")
-          let pending = sslPending(self.sslHandle)
-          if pending >= 0:
-            var datad = newString(65565)
-            sslLoop(self, sslRead(self.sslHandle, cast[cstring](addr datad[0]), 65565.cint))
-            if readUnbufferedCallback != nil:
-             readUnbufferedCallback(self, datad)
-           
-          
-
-          
-          
+    if wait:
+      result = await self.stream.recv(size)
     else:
-      if readUnbufferedCallback != nil:
-        readUnbufferedCallback(self, data)
+      result = await self.stream.recvSingle(size)
 
-
-          
-
-  
-  self.address = host
-  self.port = port
-  self.stream = await tcp.dial(host, port, buffered = buffered, readCallback = readCallback)
+proc connect*(self: HttpTcpStream, hostname: string, hostnameptr: ptr AddrInfo): Future[void] {.async.} =  
+  self.stream = await tcp.dial(hostnameptr)
   when defineSsl:
 
     if self.useSSL:
-      self.readFuture = newFuture[void]("HttpTcpStream.readFuture")
+      #self.readFuture = newFuture[void]("HttpTcpStream.readFuture")
+      if not isIpAddress(hostname):
+        discard SSL_set_tlsext_host_name(self.sslHandle, hostname)
+      sslSetConnectState(self.sslHandle)
+
+      sslLoop(self, sslDoHandshake(self.sslHandle))
+
+proc connect*(self: HttpTcpStream, host: string, port: Port): Future[void] {.async.} =  
+  self.stream = await tcp.dial(host, port)
+  when defineSsl:
+
+    if self.useSSL:
+      #self.readFuture = newFuture[void]("HttpTcpStream.readFuture")
       if not isIpAddress(host):
         discard SSL_set_tlsext_host_name(self.sslHandle, host)
       sslSetConnectState(self.sslHandle)

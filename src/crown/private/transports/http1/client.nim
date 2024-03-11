@@ -5,20 +5,22 @@ import ../../utils
 import std/net
 import ../base_tcp
 import picohttpparser
-
-import std/asyncfile
-
+import base
+import pkg/uva/resolveaddr
 from std/httpclient import ProtocolError, HttpRequestError
 
-type HTTP1Base* = ref object of RootObj
-    allowHTTP10*: bool
-    allowHTTP11*: bool
-    allowUpgradeToHTTP2*: bool
-    socket*: HttpTcpStream
-    connectionKeepAlive*: bool
+type Dasfdsfsdfds* = ref object
+    future*: Future[void]
 
 type HTTP1Client* = ref object of HTTP1Base
+    readComplete*: Dasfdsfsdfds
+    busy*: bool
 
+proc removeBusy*(self: HTTP1Client) =
+    self.busy = false
+    if (not isNil self.readComplete) and (not isNil self.readComplete) and (not self.readComplete.future.finished):
+        self.readComplete.future.complete()
+        
 proc generateHeaders(version: utils.Http1Version, url: Uri, `method`: HttpMethod, headers: HttpHeaders): string =
     result = &"{`method`} "
     result.add(url.path)
@@ -41,6 +43,7 @@ proc generateHeaders(version: utils.Http1Version, url: Uri, `method`: HttpMethod
     result.add(httpNewLine)
 
 proc bodyReader*(self: HTTP1Client, stream: FutureStream[string], version: int, contentLength: int, alreadyRead = 0) {.async.} =
+
     if alreadyRead >= contentLength:
         stream.complete()
         if version == 1 and not self.connectionKeepAlive:
@@ -53,13 +56,14 @@ proc bodyReader*(self: HTTP1Client, stream: FutureStream[string], version: int, 
         let buffer = await self.socket.recv(contentLength - read, false)
         if buffer.len == 0:
             if contentLength != 0 and read != contentLength:
+
                 stream.fail(newException(HttpRequestError, "Got disconnected while trying to read body."))
-                break
+                return
             else:
                 break
         read += buffer.len
         await stream.write(buffer)
-
+    self.removeBusy()
     stream.complete()
     
     if not self.connectionKeepAlive:
@@ -80,6 +84,7 @@ proc bodyChunkedReader*(self: HTTP1Client, stream: FutureStream[string], version
         else:
             body = await self.socket.recv(BufferSize, false)
             if body.len == 0:
+                self.removeBusy()
                 stream.fail(newException(HttpRequestError, "Got disconnected while trying to read body."))
                 break
             bufsz = body.len.csize_t
@@ -87,6 +92,8 @@ proc bodyChunkedReader*(self: HTTP1Client, stream: FutureStream[string], version
         
         case state
         of -1:
+            self.removeBusy()
+            await self.socket.close()
             stream.fail(newException(HttpRequestError, "Invalid chunked encoding"))
         of -2:
             if bufsz > 0:
@@ -96,6 +103,7 @@ proc bodyChunkedReader*(self: HTTP1Client, stream: FutureStream[string], version
             if bufsz > 0:
                 body.setLen(bufsz)
                 await stream.write(move(body))
+            self.removeBusy()
             stream.complete()
 
             if not self.connectionKeepAlive:
@@ -103,6 +111,7 @@ proc bodyChunkedReader*(self: HTTP1Client, stream: FutureStream[string], version
 
             return
         else:
+            self.removeBusy()
             stream.complete()
             if not self.connectionKeepAlive:
                 await self.socket.close()
@@ -113,6 +122,7 @@ proc readForever*(self: HTTP1Client, stream: FutureStream[string]) {.async.} =
     while true:
         let buffer = await self.socket.recv(BufferSize, false)
         if buffer.len == 0:
+            self.removeBusy()
             stream.complete()
             break
         await stream.write(buffer)       
@@ -176,37 +186,66 @@ proc responseReader*(self: HTTP1Client): Future[(string, HttpHeaders, Option[Fut
 
     if result[1].getOrDefault("Transfer-Encoding").contains("chunked"):
         result[2] = some(newFutureStream[string]("HTTP1Client.responseReader"))
-        asyncCheck self.bodyChunkedReader(result[2].get, minorVersion, move(buffer))
+        try:
+            asyncCheck self.bodyChunkedReader(result[2].get, minorVersion, move(buffer))
+        except:
+            removeBusy(self)
+            raise
     elif result[1].getOrDefault("Content-Length") notin ["", "0"]:
         let length = result[1].getOrDefault("Content-Length").parseInt()
         result[2] = some(newFutureStream[string]("HTTP1Client.responseReader"))
         if alreadyRead > 0:
             await result[2].get.write(move(buffer))
-        asyncCheck self.bodyReader(result[2].get, minorVersion, length, alreadyRead = alreadyRead)
+        try:
+            asyncCheck self.bodyReader(result[2].get, minorVersion, length, alreadyRead = alreadyRead)
+        except:
+            removeBusy(self)
+            raise
     elif not result[1].hasKey("Content-Length") and minorVersion == 0:
         result[2] = some(newFutureStream[string]("HTTP1Client.responseReader"))
         if alreadyRead > 0:
             await result[2].get.write(move(buffer))
-        asyncCheck self.readForever(result[2].get)
+        try:
+            asyncCheck self.readForever(result[2].get)
+        except:
+            removeBusy(self)
+            raise
+    else:
+        self.removeBusy()
             
     
-proc sendRequest*(self: HTTP1Client, url: Uri, `method`: HttpMethod, headers: HttpHeaders, body: FutureStream[string] | string = "", contentLength: int = 0): Future[(string, HttpHeaders, Option[FutureStream[string]])] {.async.} = 
-    var version: utils.Http1Version
-    if self.allowHTTP11:
-        version = utils.HttpVersion11
-    elif self.allowHTTP10:
-        version = utils.HttpVersion10
-    else:
-        raise newException(HttpRequestError, "No HTTP version allowed")
-
-    var newHeaders: HttpHeaders
+proc sendRequest*(self: HTTP1Client, url: Uri, `method`: HttpMethod, headers: HttpHeaders, body: FutureStream[string] | string = "", contentLength: int = 0, timeout = 5000.uint): Future[(string, HttpHeaders, Option[FutureStream[string]])] {.async.} = 
     
+    self.busy = true
+    try:
 
-    block:
-        newHeaders = newHttpHeaders()
+        var version: utils.Http1Version
+        if self.allowHTTP11:
+            version = utils.HttpVersion11
+        elif self.allowHTTP10:
+            version = utils.HttpVersion10
+        else:
+            raise newException(HttpRequestError, "No HTTP version allowed")
 
-        if headers != nil:
-            if not headers.hasKey("Content-Length"):
+        var newHeaders: HttpHeaders
+        
+
+        block:
+            newHeaders = newHttpHeaders()
+
+            if headers != nil:
+                if not headers.hasKey("Content-Length"):
+                    if contentLength != 0:
+                        newHeaders.add("Content-Length", $contentLength)
+                    else:
+                        when body is string:
+                            if body.len > 0:
+                                newHeaders.add("Content-Length", $body.len)
+                        else:
+                            raise newException(ValueError, "Content-Length must be specified when using FutureStream[string] as body")
+                for key, val in headers:
+                    newHeaders.add(key, val)
+            else:
                 if contentLength != 0:
                     newHeaders.add("Content-Length", $contentLength)
                 else:
@@ -215,93 +254,36 @@ proc sendRequest*(self: HTTP1Client, url: Uri, `method`: HttpMethod, headers: Ht
                             newHeaders.add("Content-Length", $body.len)
                     else:
                         raise newException(ValueError, "Content-Length must be specified when using FutureStream[string] as body")
-            for key, val in headers:
-                newHeaders.add(key, val)
-        else:
-            if contentLength != 0:
-                newHeaders.add("Content-Length", $contentLength)
-            else:
-                when body is string:
-                    if body.len > 0:
-                        newHeaders.add("Content-Length", $body.len)
-                else:
-                    raise newException(ValueError, "Content-Length must be specified when using FutureStream[string] as body")
-    
-
-    if (not newHeaders.hasKey("Connection") or newHeaders.getOrDefault("Connection") == "keep-alive") and version == HttpVersion11:
-        self.connectionKeepAlive = true
-    else:
-        self.connectionKeepAlive = false
-
-    let rawHeader = generateHeaders(version, url, `method`, newHeaders)
-
-    if self.socket.isClosed:
-        raise newException(HttpRequestError, "Socket is closed")
-
-    await self.socket.send(rawHeader)
-    when body is string:
-        if body.len > 0:
-            await self.socket.send(body)
-    else:
-        while not body.finished:
-            await self.socket.send(await body.read)
-    return await responseReader(self)
-
-
-proc ac() {.async.} = 
-    echo "dial"
-
-    let net = HttpTcpStream()
-    wrapSSL(net, newContext(verifyMode = CVerifyNone))
-    await net.connect("localhost", 5000.Port)
-   # await net.connect("testfileorg.netwet.net", 443.Port)
-    echo "dial done"
-    var http1 = HTTP1Client(allowHTTP10: true, socket: net)
-    echo "send request"
-    let headers = newHttpHeaders()
-    var req = await http1.sendRequest(uri.parseUri("https://localhost/"), HttpGet, headers)
-
-    echo req
-    echo "send request done"
-    if not req[2].isSome:
-        echo "no response"
-    else:
-        echo "response ok"
-        while true:
-            echo "read:      ", await req[2].get.read()
-            if req[2].get.finished:
-                break
-        echo "akk"
-    
- #   req = await http1.sendRequest(uri.parseUri("https://localhost/test/"), HttpGet, headers)
-   # if not req[2].isSome:
-   #     echo "no response"
-   # else:
-#        echo "response ok"
- #       while true:
-  #          echo "read:      ", await req[2].get.read()
-#            if req[2].get.finished:
- #               break
-    
-        #let file = openAsync("1gb.bin", fmReafdWrite)
-
-        #await file.writeFromStream(req[2].get)
-        #echo "akk"
-
-
-   # else:
-        #while not req[2].get.finished:
-            #echo "LINEBELLO", await req[2].get.read()
-    
         
-asyncCheck ac()
-runForever()
 
-    
+        if (not newHeaders.hasKey("Connection") or newHeaders.getOrDefault("Connection") == "keep-alive") and version == HttpVersion11:
+            self.connectionKeepAlive = true
+        else:
+            self.connectionKeepAlive = false
 
-    
+        let rawHeader = generateHeaders(version, url, `method`, newHeaders)
 
+        if self.socket.isClosed:
+            raise newException(HttpRequestError, "Socket is closed")
+        
 
+        await self.socket.send(rawHeader)
+        when body is string:
+            if body.len > 0:
+                await self.socket.send(body)
+        else:
+            while not body.finished:
+                await self.socket.send(await body.read)
+        let read = responseReader(self)
+        let timeout = await withTimeout(read, timeout)
+        if timeout:
+            return read.read
+        else:
+            removeBusy(self)
+            await self.socket.close()
+            raise newException(TimeoutError, "Timeout while waiting for response")
 
-
+    except:
+        removeBusy(self)
+        raise
 
