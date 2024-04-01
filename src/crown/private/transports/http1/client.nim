@@ -1,5 +1,5 @@
 import std/httpcore
-import pkg/uva, pkg/uva/tcp, std/asyncstreams, std/options
+import pkg/uva, pkg/uva/tcp, pkg/uva/futurestreams, std/options
 import std/uri, std/strformat, std/strutils, std/parseutils
 import ../../utils
 import std/net
@@ -128,7 +128,7 @@ proc readForever*(self: HTTP1Client, stream: FutureStream[string]) {.async.} =
         await stream.write(buffer)       
     self.socket.close()
 
-proc responseReader*(self: HTTP1Client): Future[(string, HttpHeaders, Option[FutureStream[string]])] {.async.} =
+proc responseReader*(self: HTTP1Client): Future[(string, HttpHeaders, FutureStream[string])] {.async.} =
     var buffer = ""
     var headers: array[MAX_HEADERS, picohttpparser.Header]
     var minorVersion: cint
@@ -184,37 +184,37 @@ proc responseReader*(self: HTTP1Client): Future[(string, HttpHeaders, Option[Fut
     if result[1].getOrDefault("Connection") == "close":
         self.connectionKeepAlive = false
 
+    result[2] = newFutureStream[string]("HTTP1Client.responseReader")
+
     if result[1].getOrDefault("Transfer-Encoding").contains("chunked"):
-        result[2] = some(newFutureStream[string]("HTTP1Client.responseReader"))
         try:
-            asyncCheck self.bodyChunkedReader(result[2].get, minorVersion, move(buffer))
+            asyncCheck self.bodyChunkedReader(result[2], minorVersion, move(buffer))
         except:
             removeBusy(self)
             raise
     elif result[1].getOrDefault("Content-Length") notin ["", "0"]:
         let length = result[1].getOrDefault("Content-Length").parseInt()
-        result[2] = some(newFutureStream[string]("HTTP1Client.responseReader"))
         if alreadyRead > 0:
-            await result[2].get.write(move(buffer))
+            await result[2].write(move(buffer))
         try:
-            asyncCheck self.bodyReader(result[2].get, minorVersion, length, alreadyRead = alreadyRead)
+            asyncCheck self.bodyReader(result[2], minorVersion, length, alreadyRead = alreadyRead)
         except:
             removeBusy(self)
             raise
     elif not result[1].hasKey("Content-Length") and minorVersion == 0:
-        result[2] = some(newFutureStream[string]("HTTP1Client.responseReader"))
         if alreadyRead > 0:
-            await result[2].get.write(move(buffer))
+            await result[2].write(move(buffer))
         try:
-            asyncCheck self.readForever(result[2].get)
+            asyncCheck self.readForever(result[2])
         except:
             removeBusy(self)
             raise
     else:
+        result[2].complete()
         self.removeBusy()
             
     
-proc sendRequest*(self: HTTP1Client, url: Uri, `method`: HttpMethod, headers: HttpHeaders, body: FutureStream[string] | string = "", contentLength: int = 0, timeout = 5000.uint): Future[(string, HttpHeaders, Option[FutureStream[string]])] {.async.} = 
+proc sendRequest*(self: HTTP1Client, url: Uri, `method`: HttpMethod, headers: HttpHeaders, body: FutureStream[string] | string = "", contentLength: int = 0, timeout = 5000.uint): Future[(string, HttpHeaders, FutureStream[string])] {.async.} = 
     
     self.busy = true
     try:

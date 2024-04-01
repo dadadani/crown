@@ -12,12 +12,13 @@ proc `=destroy`(x: AddrHolder) =
     uv_freeaddrinfo(x.hostname)
 
 
+
 type Http1Multiplexer* = object 
     lastDestroy: int64
-    pool: TableRef[string, (int64, Dasfdsfsdfds, seq[HTTP1Client], AddrHolder)]
+    pool: TableRef[string, (int64, Dasfdsfsdfds, seq[HTTP1Client], AddrHolder, Future[void])]
 
 proc initHttp1Multiplexer*(): Http1Multiplexer =
-    result.pool = newTable[string, (int64, Dasfdsfsdfds, seq[HTTP1Client], AddrHolder)]()
+    result.pool = newTable[string, (int64, Dasfdsfsdfds, seq[HTTP1Client], AddrHolder, Future[void])]()
     result.lastDestroy = now().toTime().toUnix()
 
 proc destroyInactive*(m: var Http1Multiplexer, maxIdleTime = 300) {.async.} =
@@ -38,13 +39,26 @@ proc destroyInactive*(m: var Http1Multiplexer, maxIdleTime = 300) {.async.} =
     for hostname in expired:
         m.pool.del(hostname)
 
-proc exists*(m: var Http1Multiplexer, hostname: string): bool =
-    return hostname in m.pool
+proc exists*(m: Http1Multiplexer, hostname: string): Future[bool] {.async.} =
+    if hostname in m.pool:
+        await m.pool[hostname][4]
+        return true
+    return false
+
+proc prepare*(m: Http1Multiplexer, hostname: string) =
+    m.pool[hostname] = (now().toTime().toUnix(), nil, newSeq[HTTP1Client](), AddrHolder(hostname: nil), newFuture[void]())
 
 proc add*(m: Http1Multiplexer, hostname: string, hostnameptr: ptr AddrInfo, firstClient: HTTP1Client, maxClients: int) =
-    echo "Adding ", hostname
-    m.pool[hostname] = (now().toTime().toUnix(), Dasfdsfsdfds(future: newFuture[void]()), newSeq[HTTP1Client](), AddrHolder(hostname: hostnameptr))
+    ## Before calling this, use `prepare`
+
+
+    #m.pool[hostname] = (now().toTime().toUnix(), Dasfdsfsdfds(future: newFuture[void]()), newSeq[HTTP1Client](), AddrHolder(hostname: hostnameptr), newFuture[void]())
+    m.pool[hostname][1] = Dasfdsfsdfds(future: newFuture[void]())
+    m.pool[hostname][3].hostname = hostnameptr
     m.pool[hostname][2].add(firstClient)
+    echo "completing future"
+    m.pool[hostname][4].complete()
+
     echo "Adding ", maxClients
     for _ in 0..<maxClients:
         m.pool[hostname][2].add(HTTP1Client(socket: HttpTcpStream()))
@@ -56,8 +70,6 @@ proc get*(m: Http1Multiplexer, hostname: string): Future[(ptr AddrInfo, HTTP1Cli
             conn.busy = true
             return (m.pool[hostname][3].hostname, conn)
 
-
-    
     await m.pool[hostname][1].future
     m.pool[hostname][1].future = newFuture[void]()
     return await get(m, hostname)

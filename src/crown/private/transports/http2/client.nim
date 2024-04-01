@@ -156,10 +156,11 @@ proc flush(self: HTTP2Client) {.async.} =
             if req.dataProvider.variant == 1:
                 req.dataProvider.StreamRcvStream.stream.callback = readDataStreamCallback
             
+        echo "Submitting request"
         streamid = submitRequest(self.session.session, nil, addr req.headers[0], csize_t(req.headers.len), (if not isNil dataProvider.source.`ptr`: addr dataProvider else: nil), cast[pointer](self))
         if streamid < 0:
             raise newException(Defect, "Failed to submit request" & $nghttp2.Error(streamid))
-
+        echo "Submitted request with streamid: ", streamid
         self.streamData[streamid] = StreamData(waiter: req.waiter, data: newFutureStream[string]("http2.data"), dataProvider: if not isNil req.dataProvider: req.dataProvider else: nil)
 
 
